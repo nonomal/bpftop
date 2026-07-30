@@ -1,6 +1,7 @@
 /**
  *
- *  Copyright 2024 Netflix, Inc.
+ *  Copyright 2024-2026 Netflix, Inc.
+ *  Copyright 2026-Present Jose Fernandez and bpftop contributors.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -15,7 +16,7 @@
  *  limitations under the License.
  *
  */
-use crate::helpers::format_percent;
+use crate::{bpf_attachment::render_prog_attachments, helpers::format_percent};
 use anyhow::{anyhow, Context, Result};
 use app::SortColumn;
 use app::{App, Mode};
@@ -29,14 +30,13 @@ use crossterm::terminal::{
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_sys::bpf_enable_stats;
 use pid_iter::PidIterSkelBuilder;
-use procfs::KernelVersion;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::Line;
 use ratatui::widgets::{
-    Axis, Block, BorderType, Borders, Cell, Chart, Dataset, GraphType, Padding, Paragraph, Row,
-    Scrollbar, ScrollbarOrientation, Table,
+    Axis, Block, BorderType, Borders, Cell, Chart, Dataset, GraphType, List, Padding, Paragraph,
+    Row, Scrollbar, ScrollbarOrientation, Table,
 };
 use ratatui::{symbols, Frame, Terminal};
 use std::fs;
@@ -52,6 +52,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tui_input::backend::crossterm::EventHandler;
 
 mod app;
+mod bpf_attachment;
 mod bpf_program;
 mod helpers;
 mod pid_iter {
@@ -67,6 +68,7 @@ const SORT_CONTROLS_FOOTER: &str =
 const SORT_INFO_FOOTER: &str = "(Esc) back";
 
 const PROCFS_BPF_STATS_ENABLED: &str = "/proc/sys/kernel/bpf_stats_enabled";
+const PROCFS_KERNEL_OSRELEASE: &str = "/proc/sys/kernel/osrelease";
 
 const TABLE_HEADER_HEIGHT: u16 = 1;
 const TABLE_HEADER_MARGIN: u16 = 1;
@@ -104,7 +106,9 @@ impl From<&BpfProgram> for Row<'_> {
             Cell::from(format_percent(bpf_program.cpu_time_percent())),
         ];
 
-        Row::new(cells).height(TABLE_ROW_HEIGHT).bottom_margin(TABLE_ROW_MARGIN)
+        Row::new(cells)
+            .height(TABLE_ROW_HEIGHT)
+            .bottom_margin(TABLE_ROW_MARGIN)
     }
 }
 
@@ -153,16 +157,16 @@ fn main() -> Result<()> {
     // Try to set this subscriber as the global default
     registry.try_init()?;
 
-    let kernel_version = KernelVersion::current()?;
+    let kernel_version = read_kernel_version()?;
     let _owned_fd: OwnedFd;
     let mut stats_enabled_via_procfs = false;
     let mut iter_link = None;
 
     info!("Starting bpftop...");
-    info!("Kernel: {:?}", kernel_version);
+    info!("Kernel: {}.{}", kernel_version.0, kernel_version.1);
 
     // enable BPF stats via syscall if kernel version >= 5.8
-    if kernel_version >= KernelVersion::new(5, 8, 0) {
+    if kernel_version >= (5, 8) {
         let fd = unsafe { bpf_enable_stats(libbpf_sys::BPF_STATS_RUN_TIME) };
         if fd < 0 {
             return Err(anyhow!("Failed to enable BPF stats via syscall"));
@@ -186,7 +190,10 @@ fn main() -> Result<()> {
     // load and attach pid_iter BPF program to get process information
     match load_pid_iter(&mut iter_link) {
         Ok(()) => info!("Successfully loaded pid_iter BPF program"),
-        Err(e) => info!("Failed to load pid_iter BPF program: {}, continuing without process information", e),
+        Err(e) => info!(
+            "Failed to load pid_iter BPF program: {}, continuing without process information",
+            e
+        ),
     }
 
     // capture panic to disable BPF stats via procfs
@@ -235,12 +242,31 @@ fn procfs_bpf_stats_is_enabled() -> Result<bool> {
         .map(|value| value.trim() == "1")
 }
 
+fn read_kernel_version() -> Result<(u32, u32)> {
+    let raw = fs::read_to_string(PROCFS_KERNEL_OSRELEASE)
+        .with_context(|| format!("Failed to read from {PROCFS_KERNEL_OSRELEASE}"))?;
+    parse_kernel_version(raw.trim()).with_context(|| {
+        format!("Failed to parse kernel version from {PROCFS_KERNEL_OSRELEASE}: {raw:?}")
+    })
+}
+
+fn parse_kernel_version(release: &str) -> Result<(u32, u32)> {
+    let mut parts = release.split(['.', '-']);
+    let major = parts
+        .next()
+        .ok_or_else(|| anyhow!("missing major component"))?
+        .parse()?;
+    let minor = parts
+        .next()
+        .ok_or_else(|| anyhow!("missing minor component"))?
+        .parse()?;
+    Ok((major, minor))
+}
+
 fn load_pid_iter(iter_link: &mut Option<libbpf_rs::Link>) -> Result<()> {
     // Temporarily suppress libbpf stderr output during loading attempt
-    let prev_print_fn = unsafe {
-        libbpf_sys::libbpf_set_print(None)
-    };
-    
+    let prev_print_fn = unsafe { libbpf_sys::libbpf_set_print(None) };
+
     let result = (|| -> Result<()> {
         let skel_builder = PidIterSkelBuilder::default();
         let mut open_object = MaybeUninit::uninit();
@@ -250,16 +276,19 @@ fn load_pid_iter(iter_link: &mut Option<libbpf_rs::Link>) -> Result<()> {
         *iter_link = skel.links.bpftop_iter;
         Ok(())
     })();
-    
+
     // Restore previous libbpf print function
     unsafe {
         libbpf_sys::libbpf_set_print(prev_print_fn);
     }
-    
+
     result
 }
 
-fn run_draw_loop<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
+fn run_draw_loop<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
 
@@ -493,30 +522,27 @@ fn render_graphs(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect::<Vec<_>>();
 
-    let mut items = vec![
+    let mut prog_info_rows = vec![
         Row::new(vec![Cell::from("Program ID"), Cell::from("Unknown")]),
         Row::new(vec![Cell::from("Program Type"), Cell::from("Unknown")]),
         Row::new(vec![Cell::from("Program Name"), Cell::from("Unknown")]),
     ];
-    let widths = [Constraint::Length(15), Constraint::Min(0)];
+    let mut attach_info_rows = vec![];
 
     if let Some(bpf_program) = app.graphs_bpf_program.lock().unwrap().clone() {
-        items = vec![
+        prog_info_rows = vec![
             Row::new(vec![
                 Cell::from("Program ID".bold()),
                 Cell::from(bpf_program.id.to_string()),
-            ])
-            .height(2),
+            ]),
             Row::new(vec![
                 Cell::from("Program Type".bold()),
                 Cell::from(bpf_program.bpf_type),
-            ])
-            .height(2),
+            ]),
             Row::new(vec![
                 Cell::from("Program Name".bold()),
                 Cell::from(bpf_program.name),
-            ])
-            .height(2),
+            ]),
             Row::new(vec![
                 Cell::from("PIDs".bold()),
                 Cell::from(
@@ -527,21 +553,32 @@ fn render_graphs(f: &mut Frame, app: &mut App, area: Rect) {
                         .collect::<Vec<String>>()
                         .join(", "),
                 ),
-            ])
-            .height(2),
+            ]),
         ];
+
+        attach_info_rows.extend(render_prog_attachments(bpf_program.id));
     }
 
-    let table = Table::new(items, widths)
-        .block(
-            Block::default()
-                .title(" Program Information ")
-                .padding(Padding::new(3, 0, 1, 0))
-                .borders(Borders::ALL),
-        )
-        .style(Style::default());
+    let info_block = Block::default()
+        .title(" Program Information ")
+        .padding(Padding::new(3, 0, 1, 0))
+        .borders(Borders::ALL);
+    let info_area = info_block.inner(sub_chunks[0][0]);
+    let info_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(prog_info_rows.len() as u16),
+            Constraint::Min(0),
+        ])
+        .split(info_area);
 
-    f.render_widget(table, sub_chunks[0][0]); // Top left
+    let prog_info = Table::new(prog_info_rows, [Constraint::Length(15), Constraint::Min(0)])
+        .style(Style::default());
+    let attach_info = List::new(attach_info_rows);
+
+    f.render_widget(info_block, sub_chunks[0][0]); // Top left
+    f.render_widget(prog_info, info_chunks[0]); // Top left - upper half
+    f.render_widget(attach_info, info_chunks[1]); // Top left - lower half
     f.render_widget(cpu_chart.clone(), sub_chunks[0][1]); // Top right
     f.render_widget(eps_chart, sub_chunks[1][0]); // Bottom left
     f.render_widget(runtime_chart, sub_chunks[1][1]); // Bottom right
@@ -675,5 +712,28 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
             f.render_widget(sort_footer, split_area[0]);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_kernel_version;
+
+    #[test]
+    fn parses_common_osrelease_formats() {
+        assert_eq!(parse_kernel_version("5.15.0").unwrap(), (5, 15));
+        assert_eq!(parse_kernel_version("7.0.1").unwrap(), (7, 0));
+        assert_eq!(parse_kernel_version("5.15.0-78-generic").unwrap(), (5, 15));
+        assert_eq!(parse_kernel_version("6.1.0-rpi7-rpi-v8").unwrap(), (6, 1));
+        assert_eq!(parse_kernel_version("5.8.0").unwrap(), (5, 8));
+        assert_eq!(parse_kernel_version("4.19").unwrap(), (4, 19));
+    }
+
+    #[test]
+    fn rejects_malformed_osrelease() {
+        assert!(parse_kernel_version("").is_err());
+        assert!(parse_kernel_version("5").is_err());
+        assert!(parse_kernel_version("linux-5.15.0").is_err());
+        assert!(parse_kernel_version("5.x").is_err());
     }
 }

@@ -8,81 +8,80 @@ on:
   pull_request:
     branches: [ "main" ]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  install_dependencies:
-    runs-on: ubuntu-latest
-    steps:
-
-    - name: Install cross
-      run: cargo install cross --git https://github.com/cross-rs/cross
-
-    - name: Cache dependencies
-      uses: actions/cache@v5.0.3
-      with:
-        path: ~/.cargo/bin
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-
-
   build_and_test:
-    needs: install_dependencies
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
     steps:
-    - uses: actions/checkout@v6.0.2
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
 
-    - name: Restore dependencies from cache
-      uses: actions/cache@v5.0.3
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y clang libelf-dev zlib1g-dev
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable as of 2026-05-03
+
+    - name: Cache Rust artifacts
+      uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
       with:
-        path: ~/.cargo/bin
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-
+        key: ${{ matrix.target }}
+
+    - name: Format
+      run: cargo fmt --all -- --check
 
     - name: Test
-      run: cross test --target ${{ matrix.target }}
+      run: cargo test
 
     - name: Clippy
-      run: cross clippy --target ${{ matrix.target }} --all --tests --all-features --no-deps
+      run: cargo clippy --all --tests --all-features --no-deps
 
     - name: Build
-      run: cross build --target ${{ matrix.target }} --release
+      if: github.event_name != 'pull_request'
+      run: cargo build --release
 
     - name: Rename binary
-      run: mv target/${{ matrix.target }}/release/bpftop target/${{ matrix.target }}/release/bpftop-${{ matrix.target }}
+      if: github.event_name != 'pull_request'
+      run: mv target/release/bpftop target/release/bpftop-${{ matrix.target }}
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v6.0.0
+      if: github.event_name != 'pull_request'
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
       with:
         name: bpftop-${{ matrix.target }}
-        path: target/${{ matrix.target }}/release/bpftop-${{ matrix.target }}
+        path: target/release/bpftop-${{ matrix.target }}
         if-no-files-found: error
 
   create_release:
     needs: build_and_test
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
 
     steps:
     - name: Download all artifacts
       id: download_artifacts
-      uses: actions/download-artifact@v7.0.0
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
       with:
         pattern: bpftop-*
         path: artifacts
         merge-multiple: true
 
     - name: Create Release and Upload Artifacts
-      uses: ncipollo/release-action@v1.20.0
+      uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd  # v1.21.0
       with:
         artifacts: artifacts/bpftop-*
         draft: true

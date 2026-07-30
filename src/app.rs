@@ -1,6 +1,7 @@
 /**
  *
- *  Copyright 2024 Netflix, Inc.
+ *  Copyright 2024-2026 Netflix, Inc.
+ *  Copyright 2026-Present Jose Fernandez and bpftop contributors.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -15,8 +16,11 @@
  *  limitations under the License.
  *
  */
-use crate::{bpf_program::{BpfProgram, Process}, helpers::program_type_to_string};
-use circular_buffer::CircularBuffer;
+use crate::{
+    bpf_program::{BpfProgram, Process},
+    helpers::program_type_as_str,
+};
+use circular_buffer::FixedCircularBuffer;
 use libbpf_rs::{query::ProgInfoIter, Iter, Link};
 use ratatui::widgets::ScrollbarState;
 use ratatui::widgets::TableState;
@@ -38,7 +42,7 @@ pub struct App {
     pub vertical_scroll_state: ScrollbarState,
     pub header_columns: [String; 7],
     pub items: Arc<Mutex<Vec<BpfProgram>>>,
-    pub data_buf: Arc<Mutex<CircularBuffer<20, PeriodMeasure>>>,
+    pub data_buf: Arc<Mutex<FixedCircularBuffer<PeriodMeasure, 20>>>,
     pub max_cpu: f64,
     pub max_eps: i64,
     pub max_runtime: u64,
@@ -136,7 +140,7 @@ impl App {
                 String::from("Total CPU %"),
             ],
             items: Arc::new(Mutex::new(vec![])),
-            data_buf: Arc::new(Mutex::new(CircularBuffer::<20, PeriodMeasure>::new())),
+            data_buf: Arc::new(Mutex::new(FixedCircularBuffer::<PeriodMeasure, 20>::new())),
             max_cpu: 0.0,
             max_eps: 0,
             max_runtime: 0,
@@ -187,7 +191,7 @@ impl App {
                 let processes = pid_map.get(&prog.id).cloned().unwrap_or_default();
 
                 // Skip bpf program if it does not match filter
-                let bpf_type = program_type_to_string(prog.ty);
+                let bpf_type = program_type_as_str(&prog.ty);
                 if !filter_str.is_empty()
                     && !bpf_type.to_lowercase().contains(&filter_str)
                     && !prog_name.to_lowercase().contains(&filter_str)
@@ -236,7 +240,7 @@ impl App {
             match *sort_col {
                 SortColumn::Ascending(col_idx) | SortColumn::Descending(col_idx) => {
                     match col_idx {
-                        1 => items.sort_unstable_by(|a, b| a.bpf_type.cmp(&b.bpf_type)),
+                        1 => items.sort_unstable_by(|a, b| a.bpf_type.cmp(b.bpf_type)),
                         2 => items.sort_unstable_by(|a, b| a.name.cmp(&b.name)),
                         3 => items.sort_unstable_by(|a, b| {
                             a.period_average_runtime_ns()
@@ -338,7 +342,7 @@ impl App {
                         i - 1
                     }
                 }
-                None => return,  // do nothing if table_state == None && previous_program() called
+                None => return, // do nothing if table_state == None && previous_program() called
             };
             self.table_state.select(Some(i));
             self.vertical_scroll_state = self.vertical_scroll_state.position(self.vertical_scroll);
@@ -459,7 +463,7 @@ mod tests {
         let mut app = App::new(1);
         let prog_1 = BpfProgram {
             id: 1,
-            bpf_type: "test".to_string(),
+            bpf_type: "test",
             name: "test".to_string(),
             prev_runtime_ns: 100,
             run_time_ns: 200,
@@ -472,7 +476,7 @@ mod tests {
 
         let prog_2 = BpfProgram {
             id: 2,
-            bpf_type: "test".to_string(),
+            bpf_type: "test",
             name: "test".to_string(),
             prev_runtime_ns: 100,
             run_time_ns: 200,
@@ -489,23 +493,50 @@ mod tests {
 
         // Initially no item is selected
         assert_eq!(app.selected_program(), None, "expected no program");
-        assert_eq!(app.vertical_scroll, 0, "expected init with 0, got: {}", app.vertical_scroll);
+        assert_eq!(
+            app.vertical_scroll, 0,
+            "expected init with 0, got: {}",
+            app.vertical_scroll
+        );
 
         // After calling next, the first item should be selected
         app.next_program();
-        assert_eq!(app.selected_program(), Some(prog_1.clone()), "expected prog_1");
-        assert_eq!(app.vertical_scroll, 0, "expected scroll 0, got: {}", app.vertical_scroll);
+        assert_eq!(
+            app.selected_program(),
+            Some(prog_1.clone()),
+            "expected prog_1"
+        );
+        assert_eq!(
+            app.vertical_scroll, 0,
+            "expected scroll 0, got: {}",
+            app.vertical_scroll
+        );
 
         // After calling next again, the second item should be selected
         app.next_program();
-        assert_eq!(app.selected_program(), Some(prog_2.clone()), "expected prog_2");
-        assert_eq!(app.vertical_scroll, 1, "expected scroll 1, got: {}", app.vertical_scroll);
+        assert_eq!(
+            app.selected_program(),
+            Some(prog_2.clone()),
+            "expected prog_2"
+        );
+        assert_eq!(
+            app.vertical_scroll, 1,
+            "expected scroll 1, got: {}",
+            app.vertical_scroll
+        );
 
         // After calling next again, the second item should still be selected without wrapping
         app.next_program();
-        assert_eq!(app.selected_program(), Some(prog_2.clone()), "expected prog_2; no wrap around");
-        assert_eq!(app.vertical_scroll, 1, "expected scroll 1, got: {}", app.vertical_scroll);
-
+        assert_eq!(
+            app.selected_program(),
+            Some(prog_2.clone()),
+            "expected prog_2; no wrap around"
+        );
+        assert_eq!(
+            app.vertical_scroll, 1,
+            "expected scroll 1, got: {}",
+            app.vertical_scroll
+        );
     }
 
     #[test]
@@ -514,17 +545,33 @@ mod tests {
 
         // Initially no item is selected
         assert_eq!(app.selected_program(), None);
-        
+
         // Initially ScrollbarState is 0
-        assert_eq!(app.vertical_scroll_state, ScrollbarState::new(0), "unexpected ScrollbarState");
-        assert_eq!(app.vertical_scroll, 0, "expected 0 vertical_scroll, got: {}", app.vertical_scroll);
+        assert_eq!(
+            app.vertical_scroll_state,
+            ScrollbarState::new(0),
+            "unexpected ScrollbarState"
+        );
+        assert_eq!(
+            app.vertical_scroll, 0,
+            "expected 0 vertical_scroll, got: {}",
+            app.vertical_scroll
+        );
 
         // After calling previous, no item should be selected
         app.previous_program();
         assert_eq!(app.selected_program(), None);
 
-        assert_eq!(app.vertical_scroll_state, ScrollbarState::new(0), "unexpected ScrollbarState");
-        assert_eq!(app.vertical_scroll, 0, "expected 0 vertical_scroll, got: {}", app.vertical_scroll);
+        assert_eq!(
+            app.vertical_scroll_state,
+            ScrollbarState::new(0),
+            "unexpected ScrollbarState"
+        );
+        assert_eq!(
+            app.vertical_scroll, 0,
+            "expected 0 vertical_scroll, got: {}",
+            app.vertical_scroll
+        );
     }
 
     #[test]
@@ -532,7 +579,7 @@ mod tests {
         let mut app = App::new(1);
         let prog_1 = BpfProgram {
             id: 1,
-            bpf_type: "test".to_string(),
+            bpf_type: "test",
             name: "test".to_string(),
             prev_runtime_ns: 100,
             run_time_ns: 200,
@@ -545,7 +592,7 @@ mod tests {
 
         let prog_2 = BpfProgram {
             id: 2,
-            bpf_type: "test".to_string(),
+            bpf_type: "test",
             name: "test".to_string(),
             prev_runtime_ns: 100,
             run_time_ns: 200,
@@ -574,13 +621,21 @@ mod tests {
         assert_eq!(app.selected_program(), None, "still None");
         assert_eq!(app.vertical_scroll, 0, "still 0, no wrapping");
 
-        app.next_program();  // populate table state and expect prog_1 selected
-        assert_eq!(app.selected_program(), Some(prog_1.clone()), "expected prog_1");
+        app.next_program(); // populate table state and expect prog_1 selected
+        assert_eq!(
+            app.selected_program(),
+            Some(prog_1.clone()),
+            "expected prog_1"
+        );
         assert_eq!(app.vertical_scroll, 0, "expected scroll 0");
 
         // After calling previous again, prog_1 should still be selected (0th index)
         app.previous_program();
-        assert_eq!(app.selected_program(), Some(prog_1.clone()), "still expecting prog_1");
+        assert_eq!(
+            app.selected_program(),
+            Some(prog_1.clone()),
+            "still expecting prog_1"
+        );
         assert_eq!(app.vertical_scroll, 0, "still 0, no wrapping");
     }
 
